@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
 	"log"
 	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +32,26 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v4"
 	"golang.org/x/crypto/bcrypt"
+)
+
+const (
+	maxUploadSize   = int64(5 << 20) // 5 MiB
+	uploadDirPrefix = "uploads"
+)
+
+var (
+	allowedExtensions = map[string]struct{}{
+		".jpg":  {},
+		".jpeg": {},
+		".png":  {},
+		".webp": {},
+	}
+	allowedMIMETypes = map[string]struct{}{
+		"image/jpeg": {},
+		"image/png":  {},
+		"image/webp": {},
+	}
+	uploadRoot = uploadDirPrefix
 )
 
 func formatCartItemLabel(count int) string {
@@ -54,24 +80,132 @@ func formatCartTotal(total float64) string {
 	return value
 }
 
+func isAllowedMIME(contentType string) bool {
+	if contentType == "" {
+		return false
+	}
+	if idx := strings.Index(contentType, ";"); idx > -1 {
+		contentType = strings.TrimSpace(contentType[:idx])
+	}
+	_, ok := allowedMIMETypes[strings.ToLower(contentType)]
+	return ok
+}
+
+func isSafePathSegment(segment string) bool {
+	return segment != "" && !strings.Contains(segment, "../") && !strings.Contains(segment, "\\") && !strings.Contains(segment, "/") && !strings.Contains(segment, "..")
+}
+
+func validateImageData(data []byte, detectedType string) error {
+	if detectedType == "image/webp" {
+		if len(data) < 12 {
+			return fmt.Errorf("webp data too short")
+		}
+		if string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+			return fmt.Errorf("invalid webp header")
+		}
+		return nil
+	}
+
+	_, _, err := image.Decode(bytes.NewReader(data))
+	return err
+}
+
+func serveUploadedFile(c *fiber.Ctx) error {
+	dir1 := c.Params("dir1")
+	dir2 := c.Params("dir2")
+	filename := c.Params("filename")
+
+	if !isSafePathSegment(dir1) || !isSafePathSegment(dir2) || !isSafePathSegment(filename) {
+		return fiber.ErrNotFound
+	}
+
+	rootPath, err := filepath.Abs(uploadRoot)
+	if err != nil {
+		return err
+	}
+	targetPath := filepath.Clean(filepath.Join(uploadRoot, dir1, dir2, filename))
+	fullPath, err := filepath.Abs(targetPath)
+	if err != nil {
+		return err
+	}
+
+	if !strings.HasPrefix(fullPath, rootPath+string(filepath.Separator)) {
+		return fiber.ErrNotFound
+	}
+
+	info, err := os.Stat(fullPath)
+	if err != nil || info.IsDir() {
+		return fiber.ErrNotFound
+	}
+
+	c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("inline; filename=\"%s\"", filename))
+	c.Type(strings.TrimPrefix(filepath.Ext(filename), "."))
+
+	return c.SendFile(fullPath)
+}
+
 func saveUploadedFile(c *fiber.Ctx, fileHeader *multipart.FileHeader) (string, error) {
 	if fileHeader == nil {
-		return "", fmt.Errorf("no file provided")
+		log.Printf("upload rejected: no file provided")
+		return "", fiber.NewError(fiber.StatusBadRequest, "Файл не предоставлен")
 	}
-	uploadDir := filepath.Join("static", "image", "upload")
-	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
-		return "", err
+	if fileHeader.Size > maxUploadSize {
+		log.Printf("upload rejected: file size %d exceeds limit", fileHeader.Size)
+		return "", fiber.NewError(fiber.StatusRequestEntityTooLarge, "Файл слишком большой")
 	}
+
 	ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
 	if ext == "" {
 		ext = ".jpg"
 	}
-	filename := uuid.NewString() + ext
-	targetPath := filepath.Join(uploadDir, filename)
+	if _, ok := allowedExtensions[ext]; !ok {
+		log.Printf("upload rejected: extension %s is not allowed", ext)
+		return "", fiber.NewError(fiber.StatusBadRequest, "Недопустимый формат файла")
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	limitedReader := io.LimitReader(file, maxUploadSize+1)
+	buf, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return "", err
+	}
+	if int64(len(buf)) > maxUploadSize {
+		log.Printf("upload rejected: file content exceeds limit after read")
+		return "", fiber.NewError(fiber.StatusRequestEntityTooLarge, "Файл слишком большой")
+	}
+
+	detectedType := http.DetectContentType(buf)
+	contentType := fileHeader.Header.Get("Content-Type")
+	if !isAllowedMIME(detectedType) || (contentType != "" && !isAllowedMIME(contentType)) {
+		log.Printf("upload rejected: MIME type header=%s detected=%s", contentType, detectedType)
+		return "", fiber.NewError(fiber.StatusBadRequest, "Недопустимый формат файла")
+	}
+
+	if err := validateImageData(buf, detectedType); err != nil {
+		log.Printf("upload rejected: failed to validate image: %v", err)
+		return "", fiber.NewError(fiber.StatusBadRequest, "Файл поврежден или не является изображением")
+	}
+
+	id := uuid.NewString()
+	subdir := filepath.Join(id[:2], id[2:4])
+	targetDir := filepath.Join(uploadRoot, subdir)
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return "", err
+	}
+
+	filename := id + ext
+	targetPath := filepath.Join(targetDir, filename)
 	if err := c.SaveFile(fileHeader, targetPath); err != nil {
 		return "", err
 	}
-	return "/static/image/upload/" + filename, nil
+
+	publicPath := "/uploads/" + filepath.ToSlash(filepath.Join(subdir, filename))
+	return publicPath, nil
 }
 
 func main() {
@@ -103,7 +237,9 @@ func run() error {
 		return err
 	}
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		BodyLimit: int(maxUploadSize),
+	})
 
 	app.Use("/a9s5-panel/login", limiter.New(limiter.Config{
 		Max:        5,
@@ -1304,6 +1440,8 @@ func run() error {
 		clearSessionCookie(c, "admin_session", "Strict")
 		return c.Redirect("/")
 	})
+
+	app.Get("/uploads/:dir1/:dir2/:filename", serveUploadedFile)
 
 	app.Static("/static", "./static")
 
