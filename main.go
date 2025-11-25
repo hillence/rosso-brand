@@ -103,6 +103,9 @@ func run() error {
 
 	app := fiber.New()
 
+	app.Use(CSRFMiddleware())
+	app.Use(CSRFResponseMiddleware())
+
 	app.Use("/a9s5-panel/login", limiter.New(limiter.Config{
 		Max:        5,
 		Expiration: time.Minute,
@@ -261,6 +264,7 @@ func run() error {
 			Value:    user.Email,
 			Expires:  time.Now().Add(24 * time.Hour),
 			HTTPOnly: true,
+			SameSite: fiber.CookieSameSiteLaxMode,
 		})
 
 		return c.Redirect("/personal")
@@ -309,6 +313,7 @@ func run() error {
 			Value:    createdUser.Email,
 			Expires:  time.Now().Add(24 * time.Hour),
 			HTTPOnly: true,
+			SameSite: fiber.CookieSameSiteLaxMode,
 		})
 
 		return c.Redirect("/personal")
@@ -1003,6 +1008,7 @@ func run() error {
 			Expires:  time.Now().Add(12 * time.Hour),
 			HTTPOnly: true,
 			Secure:   true,
+			SameSite: fiber.CookieSameSiteLaxMode,
 		})
 
 		return c.Redirect("/a9s5-panel/")
@@ -1303,12 +1309,15 @@ func run() error {
 			Value:    "",
 			Expires:  time.Now().Add(-1 * time.Hour),
 			HTTPOnly: true,
+			SameSite: fiber.CookieSameSiteLaxMode,
 		})
 		c.Cookie(&fiber.Cookie{
 			Name:     "admin_session",
 			Value:    "",
 			Expires:  time.Now().Add(-1 * time.Hour),
 			HTTPOnly: true,
+			SameSite: fiber.CookieSameSiteLaxMode,
+			Secure:   true,
 		})
 		return c.Redirect("/")
 	})
@@ -1440,6 +1449,7 @@ func ensureGuestSessionToken(c *fiber.Ctx) (string, error) {
 			Value:    token,
 			Expires:  time.Now().Add(30 * 24 * time.Hour),
 			HTTPOnly: true,
+			SameSite: fiber.CookieSameSiteLaxMode,
 		})
 	}
 	if err := database.EnsureGuestSession(token); err != nil {
