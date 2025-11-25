@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -256,12 +258,12 @@ func run() error {
 			return fiber.ErrUnauthorized
 		}
 
-		c.Cookie(&fiber.Cookie{
-			Name:     "session_token",
-			Value:    user.Email,
-			Expires:  time.Now().Add(24 * time.Hour),
-			HTTPOnly: true,
-		})
+		if existing := c.Cookies("session_token"); existing != "" {
+			_ = database.DeleteSession(existing)
+		}
+		if err := issueSession(c, user.ID, false, 24*time.Hour, "session_token", "Lax"); err != nil {
+			return err
+		}
 
 		return c.Redirect("/personal")
 	})
@@ -304,12 +306,9 @@ func run() error {
 			return err
 		}
 
-		c.Cookie(&fiber.Cookie{
-			Name:     "session_token",
-			Value:    createdUser.Email,
-			Expires:  time.Now().Add(24 * time.Hour),
-			HTTPOnly: true,
-		})
+		if err := issueSession(c, createdUser.ID, false, 24*time.Hour, "session_token", "Lax"); err != nil {
+			return err
+		}
 
 		return c.Redirect("/personal")
 	})
@@ -997,13 +996,12 @@ func run() error {
 			return fiber.ErrUnauthorized
 		}
 
-		c.Cookie(&fiber.Cookie{
-			Name:     "admin_session",
-			Value:    user.Email,
-			Expires:  time.Now().Add(12 * time.Hour),
-			HTTPOnly: true,
-			Secure:   true,
-		})
+		if existing := c.Cookies("admin_session"); existing != "" {
+			_ = database.DeleteSession(existing)
+		}
+		if err := issueSession(c, user.ID, true, 12*time.Hour, "admin_session", "Strict"); err != nil {
+			return err
+		}
 
 		return c.Redirect("/a9s5-panel/")
 	})
@@ -1096,13 +1094,11 @@ func run() error {
 	})
 
 	admin.Post("/logout", func(c *fiber.Ctx) error {
-		c.Cookie(&fiber.Cookie{
-			Name:     "admin_session",
-			Value:    "",
-			Expires:  time.Now().Add(-1 * time.Hour),
-			HTTPOnly: true,
-			Secure:   true,
-		})
+		token := c.Cookies("admin_session")
+		if token != "" {
+			_ = database.DeleteSession(token)
+		}
+		clearSessionCookie(c, "admin_session", "Strict")
 		return c.Redirect("/a9s5-panel/login")
 	})
 
@@ -1298,18 +1294,14 @@ func run() error {
 	})
 
 	app.Post("/logout", func(c *fiber.Ctx) error {
-		c.Cookie(&fiber.Cookie{
-			Name:     "session_token",
-			Value:    "",
-			Expires:  time.Now().Add(-1 * time.Hour),
-			HTTPOnly: true,
-		})
-		c.Cookie(&fiber.Cookie{
-			Name:     "admin_session",
-			Value:    "",
-			Expires:  time.Now().Add(-1 * time.Hour),
-			HTTPOnly: true,
-		})
+		if token := c.Cookies("session_token"); token != "" {
+			_ = database.DeleteSession(token)
+		}
+		if token := c.Cookies("admin_session"); token != "" {
+			_ = database.DeleteSession(token)
+		}
+		clearSessionCookie(c, "session_token", "Lax")
+		clearSessionCookie(c, "admin_session", "Strict")
 		return c.Redirect("/")
 	})
 
@@ -1367,15 +1359,28 @@ func normalizePort(value string) string {
 
 func AdminMiddleware(adminEmail string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		email := strings.TrimSpace(c.Cookies("admin_session"))
-		if email == "" {
+		token := strings.TrimSpace(c.Cookies("admin_session"))
+		if token == "" {
 			return c.Redirect("/a9s5-panel/login")
 		}
-		user, err := database.GetUserByEmail(email)
+		session, err := database.GetSession(token)
+		if err != nil {
+			return err
+		}
+		if session == nil || !session.IsAdmin || time.Now().After(session.Expires) {
+			_ = database.DeleteSession(token)
+			clearSessionCookie(c, "admin_session", "Strict")
+			return c.Redirect("/a9s5-panel/login")
+		}
+		user, err := database.GetUserByID(session.UserID)
 		if err != nil || user == nil {
+			_ = database.DeleteSession(token)
+			clearSessionCookie(c, "admin_session", "Strict")
 			return c.Redirect("/a9s5-panel/login")
 		}
 		if !user.IsAdmin || !strings.EqualFold(user.Email, adminEmail) {
+			_ = database.DeleteSession(token)
+			clearSessionCookie(c, "admin_session", "Strict")
 			return c.Redirect("/a9s5-panel/login")
 		}
 		c.Locals("currentAdmin", user)
@@ -1394,6 +1399,45 @@ func AuthMiddleware(c *fiber.Ctx) error {
 	return c.Next()
 }
 
+func generateSessionToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func issueSession(c *fiber.Ctx, userID int, isAdmin bool, ttl time.Duration, cookieName, sameSite string) error {
+	token, err := generateSessionToken()
+	if err != nil {
+		return err
+	}
+	expires := time.Now().Add(ttl)
+	if err := database.CreateSession(userID, isAdmin, token, expires); err != nil {
+		return err
+	}
+	c.Cookie(&fiber.Cookie{
+		Name:     cookieName,
+		Value:    token,
+		Expires:  expires,
+		HTTPOnly: true,
+		Secure:   true,
+		SameSite: sameSite,
+	})
+	return nil
+}
+
+func clearSessionCookie(c *fiber.Ctx, name, sameSite string) {
+	c.Cookie(&fiber.Cookie{
+		Name:     name,
+		Value:    "",
+		Expires:  time.Now().Add(-1 * time.Hour),
+		HTTPOnly: true,
+		Secure:   true,
+		SameSite: sameSite,
+	})
+}
+
 func getCurrentUser(c *fiber.Ctx) (*database.User, error) {
 	if cached := c.Locals("currentUser"); cached != nil {
 		if user, ok := cached.(*database.User); ok {
@@ -1401,12 +1445,22 @@ func getCurrentUser(c *fiber.Ctx) (*database.User, error) {
 		}
 	}
 
-	token := c.Cookies("session_token")
+	token := strings.TrimSpace(c.Cookies("session_token"))
 	if token == "" {
 		return nil, nil
 	}
 
-	user, err := database.GetUserByEmail(token)
+	session, err := database.GetSession(token)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil || time.Now().After(session.Expires) {
+		_ = database.DeleteSession(token)
+		clearSessionCookie(c, "session_token", "Lax")
+		return nil, nil
+	}
+
+	user, err := database.GetUserByID(session.UserID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
