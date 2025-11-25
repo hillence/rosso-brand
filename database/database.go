@@ -262,6 +262,16 @@ func Migrate() error {
 
         ALTER TABLE cart_items
             ADD CONSTRAINT cart_items_pkey PRIMARY KEY (user_id, product_id, size);
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
     `)
 	return err
 }
@@ -288,6 +298,14 @@ type MenuSectionImage struct {
 	Section   string
 	ImageURL  string
 	UpdatedAt time.Time
+}
+
+type Session struct {
+	Token   string
+	UserID  int
+	IsAdmin bool
+	Expires time.Time
+	Created time.Time
 }
 
 func CreateUserWithHash(email, passwordHash, firstName, lastName, phone string, isAdmin bool) (*User, error) {
@@ -497,6 +515,17 @@ func GetUserByEmail(email string) (*User, error) {
 		return nil, err
 	}
 
+	return user, nil
+}
+
+func GetUserByID(userID int) (*User, error) {
+	user := &User{}
+	err := DB.QueryRow(context.Background(),
+		"SELECT id, email, password_hash, is_admin, COALESCE(first_name, ''), COALESCE(last_name, ''), COALESCE(avatar_url, ''), COALESCE(phone, '') FROM users WHERE id = $1",
+		userID).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.IsAdmin, &user.FirstName, &user.LastName, &user.AvatarURL, &user.Phone)
+	if err != nil {
+		return nil, err
+	}
 	return user, nil
 }
 
@@ -1640,4 +1669,41 @@ func GetFavoriteCount(userID int) (int, error) {
 		"SELECT COUNT(*) FROM favorites WHERE user_id = $1",
 		userID).Scan(&count)
 	return count, err
+}
+
+func CreateSession(userID int, isAdmin bool, token string, expiresAt time.Time) error {
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("session token is required")
+	}
+	_, err := DB.Exec(context.Background(),
+		"INSERT INTO sessions (token, user_id, is_admin, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, is_admin = EXCLUDED.is_admin, expires_at = EXCLUDED.expires_at",
+		token, userID, isAdmin, expiresAt)
+	return err
+}
+
+func GetSession(token string) (*Session, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, nil
+	}
+	session := &Session{}
+	err := DB.QueryRow(context.Background(),
+		"SELECT token, user_id, COALESCE(is_admin, FALSE), expires_at, created_at FROM sessions WHERE token = $1",
+		token).Scan(&session.Token, &session.UserID, &session.IsAdmin, &session.Expires, &session.Created)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return session, nil
+}
+
+func DeleteSession(token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil
+	}
+	_, err := DB.Exec(context.Background(), "DELETE FROM sessions WHERE token = $1", token)
+	return err
 }
