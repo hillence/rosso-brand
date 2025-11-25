@@ -1,0 +1,21 @@
+[build]
+  cmd = "mkdir -p .air/bin && go build -o .air/bin/main main.go"
+  bin = ".air/bin/main"
+  include_ext = ["go", "templ", "html", "css", "js"]
+  exclude_dir = ["vendor", ".git", ".air", ".cache", "image", "localpg", "pgsocket"]
+  exclude_regex = ["_templ\\.go"]
+  delay = 1000
+
+[log]
+  time = true
+
+[serve]
+  cmd = ".air/bin/main"
+  env = [
+    "PORT=3000",
+    "DATABASE_URL=postgres://user:password@localhost:5432/gogo?sslmode=disable",
+  ]
+  delay = 100
+
+[misc]
+  clean_on_exit = true
